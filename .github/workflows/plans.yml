@@ -1,0 +1,126 @@
+name: Crawl Plans
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "年份，支持单年(2025)、范围(2025-2020)、列表(2025,2024,2023)"
+        required: true
+        default: "2025"
+      sample_schools:
+        description: "仅爬取前 N 所学校，0 表示全部"
+        required: false
+        default: "0"
+      max_workers:
+        description: "并发线程数"
+        required: false
+        default: "6"
+      resume_run:
+        description: "是否为自动续跑"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: crawl-plans-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      PLAN_YEARS: ${{ inputs.years }}
+      SAMPLE_SCHOOLS: ${{ inputs.sample_schools }}
+      PLAN_MAX_WORKERS: ${{ inputs.max_workers }}
+      PLAN_RESUME: "1"
+      PLAN_TIME_LIMIT_SECONDS: "17100"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run crawler
+        id: crawl
+        shell: bash
+        run: |
+          mkdir -p data
+          python -m crawlers.plans "${PLAN_YEARS}" | tee crawl.log
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          progress_path = Path("data/plans_progress.json")
+          meta = {}
+
+          if progress_path.exists():
+              progress = json.loads(progress_path.read_text(encoding="utf-8"))
+              meta = progress.get("meta", {})
+
+          Path("resume.env").write_text(
+              "\n".join([
+                  f"RESUME_REQUIRED={str(meta.get('resume_required', False)).lower()}",
+                  f"RESUME_YEARS={meta.get('years_arg', '')}",
+                  f"REMAINING_TASKS={meta.get('remaining_tasks', 0)}",
+              ]) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          cat resume.env >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plans-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            data/plans.json
+            data/plans_progress.json
+            crawl.log
+          if-no-files-found: warn
+
+      - name: Commit progress data
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/plans.json data/plans_progress.json || true
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update plans data (${PLAN_YEARS}) [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin HEAD:"${GITHUB_REF_NAME}"
+          else
+            echo "No data changes to commit"
+          fi
+
+      - name: Trigger resume workflow
+        if: always() && env.RESUME_REQUIRED == 'true'
+        shell: bash
+        run: |
+          echo "Need resume, remaining tasks: ${REMAINING_TASKS}"
+          gh workflow run plans.yml \
+            --ref "${GITHUB_REF_NAME}" \
+            -f years="${RESUME_YEARS}" \
+            -f sample_schools="${{ inputs.sample_schools }}" \
+            -f max_workers="${{ inputs.max_workers }}" \
+            -f resume_run="true"
