@@ -31,14 +31,14 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 330
     env:
       PLAN_YEARS: ${{ inputs.years }}
       SAMPLE_SCHOOLS: ${{ inputs.sample_schools }}
       PLAN_MAX_WORKERS: ${{ inputs.max_workers }}
       PLAN_RESUME: "1"
       PLAN_TIME_LIMIT_SECONDS: "17100"
-      PLAN_CHUNK_RECORD_LIMIT: "200000"
+      PLAN_CHUNK_RECORD_LIMIT: "100000"
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -87,19 +87,16 @@ jobs:
 
           progress_path = Path("data/plans_progress.json")
           meta = {}
-          chunk_files = []
 
           if progress_path.exists():
               progress = json.loads(progress_path.read_text(encoding="utf-8"))
               meta = progress.get("meta", {})
-              chunk_files = progress.get("chunk_files", [])
 
           Path("resume.env").write_text(
               "\n".join([
                   f"RESUME_REQUIRED={str(meta.get('resume_required', False)).lower()}",
                   f"RESUME_YEARS={meta.get('years_arg', '')}",
                   f"REMAINING_TASKS={meta.get('remaining_tasks', 0)}",
-                  f"CHUNK_FILES={' '.join(chunk_files)}",
               ]) + "\n",
               encoding="utf-8"
           )
@@ -107,28 +104,73 @@ jobs:
 
           cat resume.env >> "$GITHUB_ENV"
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: plans-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            data/plans_progress.json
-            data/manifest.json
-            data/chunks
-            crawl.log
-          if-no-files-found: warn
-
-      - name: Upload chunks to release
+      - name: Upload files to release via curl
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
+
+          TAG="plans-data"
+          REPO="${GITHUB_REPOSITORY}"
+
+          release_id="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.id')"
+          upload_url="$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.upload_url' | sed 's/{?name,label}//')"
+
+          delete_asset_if_exists() {
+            local asset_name="$1"
+            local asset_id
+            asset_id="$(gh api "repos/${REPO}/releases/${release_id}/assets" --paginate --jq ".[] | select(.name == \"${asset_name}\") | .id" | head -n 1 || true)"
+            if [ -n "${asset_id}" ]; then
+              gh api -X DELETE "repos/${REPO}/releases/assets/${asset_id}"
+            fi
+          }
+
+          upload_file() {
+            local file_path="$1"
+            local asset_name
+            local content_type
+            local attempt
+
+            [ -f "$file_path" ] || return 0
+
+            asset_name="$(basename "$file_path")"
+
+            case "$asset_name" in
+              *.jsonl.gz) content_type="application/gzip" ;;
+              *.json) content_type="application/json" ;;
+              *) content_type="application/octet-stream" ;;
+            esac
+
+            delete_asset_if_exists "$asset_name"
+
+            for attempt in 1 2 3; do
+              echo "Uploading ${asset_name}, attempt ${attempt}..."
+              if curl --fail --silent --show-error --http1.1 \
+                -X POST \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Content-Type: ${content_type}" \
+                --data-binary @"${file_path}" \
+                "${upload_url}?name=${asset_name}"; then
+                echo "Uploaded ${asset_name}"
+                return 0
+              fi
+
+              echo "Upload failed for ${asset_name}, retrying..."
+              sleep $((attempt * 10))
+            done
+
+            echo "Upload failed after 3 attempts: ${asset_name}"
+            exit 1
+          }
+
           if compgen -G "data/chunks/*.jsonl.gz" > /dev/null; then
-            gh release upload plans-data data/chunks/*.jsonl.gz --clobber
+            for f in data/chunks/*.jsonl.gz; do
+              upload_file "$f"
+            done
           fi
 
-          [ -f data/plans_progress.json ] && gh release upload plans-data data/plans_progress.json --clobber
-          [ -f data/manifest.json ] && gh release upload plans-data data/manifest.json --clobber
+          upload_file "data/plans_progress.json"
+          upload_file "data/manifest.json"
 
       - name: Commit only metadata
         if: always()
