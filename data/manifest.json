@@ -1,5 +1,5 @@
 {
-  "update_time": "2026-04-26 00:29:59",
+  "update_time": "2026-04-26 00:39:37",
   "scope_signature": "4db1415da5a0f7f02ac68c04e23522d3",
   "scope_name": "2025-2024-2023-2022-2021-2020",
   "years": [
@@ -12,17 +12,19 @@
   ],
   "school_count": 2956,
   "province_count": 34,
-  "total_records": 90162,
-  "chunk_record_limit": 200000,
+  "total_records": 207199,
+  "chunk_record_limit": 100000,
   "chunk_files": [
-    "plans-2025-2024-2023-2022-2021-2020-00001.jsonl.gz"
+    "plans-2025-2024-2023-2022-2021-2020-00001.jsonl.gz",
+    "plans-2025-2024-2023-2022-2021-2020-00002.jsonl.gz",
+    "plans-2025-2024-2023-2022-2021-2020-00003.jsonl.gz"
   ],
   "meta": {
     "finished": false,
     "resume_required": true,
     "total_tasks": 603024,
-    "completed_tasks": 3600,
-    "total_records": 90162,
+    "completed_tasks": 7200,
+    "total_records": 207199,
     "max_workers": 6,
     "years": [
       "2025",
@@ -32,17 +34,17 @@
       "2021",
       "2020"
     ],
-    "remaining_tasks": 599424,
+    "remaining_tasks": 595824,
     "remaining_years": [
+      "2024",
+      "2023",
       "2022",
       "2021",
       "2020",
-      "2025",
-      "2024",
-      "2023"
+      "2025"
     ],
-    "years_arg": "2022,2021,2020,2025,2024,2023",
-    "chunk_files_count": 1,
+    "years_arg": "2024,2023,2022,2021,2020,2025",
+    "chunk_files_count": 3,
     "scope_signature": "4db1415da5a0f7f02ac68c04e23522d3",
     "scope_name": "2025-2024-2023-2022-2021-2020"
   }
