@@ -309,4 +309,217 @@ class PlanCrawler(BaseCrawler):
             return records
 
         with self._first_log_lock:
-            if 
+            if not self._first_logged:
+                print("\n" + "─" * 60)
+                print("首次成功响应结构")
+                print(f"school_id={school_id}, year={year}, province={province_name}")
+                print(f"data keys: {list(data.keys())}")
+                print("─" * 60 + "\n")
+                self._first_logged = True
+
+        for plan_type, plan_info in data.items():
+            if not isinstance(plan_info, dict):
+                continue
+
+            items = plan_info.get("item", [])
+            if not isinstance(items, list):
+                continue
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                records.append(
+                    {
+                        "school_id": school_id,
+                        "year": year,
+                        "province_id": province_id,
+                        "province": province_name,
+                        "plan_type": plan_type,
+                        "batch": item.get("local_batch_name"),
+                        "type": item.get("type"),
+                        "major": item.get("sp_name") or item.get("spname"),
+                        "major_code": item.get("spcode"),
+                        "major_group": item.get("sg_name"),
+                        "major_group_code": item.get("sg_code"),
+                        "major_group_info": item.get("sg_info"),
+                        "level1_name": item.get("level1_name"),
+                        "level2_name": item.get("level2_name"),
+                        "level3_name": item.get("level3_name"),
+                        "plan_number": item.get("num") or item.get("plan_num"),
+                        "years": item.get("length") or item.get("years"),
+                        "tuition": item.get("tuition"),
+                        "note": item.get("note") or item.get("remark"),
+                    }
+                )
+
+        return records
+
+    def worker(self, task):
+        school_id, year, province_id = task
+
+        if self.should_stop():
+            return {"task": task, "status": "stopped", "records": []}
+
+        data = self.get_plan_data(school_id, year, province_id)
+        time.sleep(random.uniform(0.05, 0.25))
+
+        if data == "no_data":
+            return {"task": task, "status": "no_data", "records": []}
+
+        if data is None:
+            return {"task": task, "status": "failed", "records": []}
+
+        records = self.parse_plan_records(school_id, year, province_id, data)
+        return {"task": task, "status": "success", "records": records}
+
+    def create_meta(self, school_ids, years, province_ids):
+        remaining_tasks = self.build_tasks(
+            school_ids, years, province_ids, self.completed_keys
+        )
+
+        remaining_years = []
+        seen = set()
+        for _, year, _ in remaining_tasks:
+            if year not in seen:
+                seen.add(year)
+                remaining_years.append(year)
+
+        return {
+            "finished": len(remaining_tasks) == 0,
+            "resume_required": len(remaining_tasks) > 0,
+            "total_tasks": len(school_ids) * len(years) * len(province_ids),
+            "completed_tasks": len(self.completed_keys),
+            "total_records": self.total_records,
+            "max_workers": self.max_workers,
+            "years": years,
+            "remaining_tasks": len(remaining_tasks),
+            "remaining_years": remaining_years,
+            "years_arg": ",".join(remaining_years) if remaining_years else ",".join(years),
+            "chunk_files_count": len(self.chunk_files),
+            "scope_signature": self.scope_signature,
+            "scope_name": self.scope_name,
+        }
+
+    def crawl(self, school_ids=None, years=None, province_ids=None):
+        if years is None:
+            years = self.parse_years(os.getenv("PLAN_YEARS", "2025,2024,2023"))
+        else:
+            years = self.parse_years(years)
+
+        if not years:
+            raise ValueError("years 不能为空")
+
+        province_ids = [str(p) for p in (province_ids or list(self.province_dict.keys()))]
+        school_ids = self.load_school_ids(school_ids)
+
+        self.scope_signature = self.build_scope_signature(school_ids, years, province_ids)
+        self.scope_name = self.build_scope_name(years)
+
+        progress = self.load_progress() if os.getenv("PLAN_RESUME", "1") == "1" else None
+
+        if progress and progress.get("scope_signature") == self.scope_signature:
+            self.restore_progress(progress)
+        else:
+            self.completed_keys = set()
+            self.reset_scope_files()
+
+        pending_tasks = self.build_tasks(
+            school_ids, years, province_ids, self.completed_keys
+        )
+
+        print("=" * 60)
+        print("开始爬取招生计划")
+        print(f"学校数: {len(school_ids)}")
+        print(f"年份: {', '.join(years)}")
+        print(f"省份数: {len(province_ids)}")
+        print(f"线程数: {self.max_workers}")
+        print(f"已完成任务数: {len(self.completed_keys)}")
+        print(f"待处理任务数: {len(pending_tasks)}")
+        print("=" * 60)
+
+        if not pending_tasks:
+            meta = self.create_meta(school_ids, years, province_ids)
+            self.save_progress(school_ids, years, province_ids, meta)
+            return meta
+
+        task_queue = list(pending_tasks)
+        inflight = {}
+        processed_since_flush = 0
+
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+
+        try:
+            while task_queue and len(inflight) < self.max_workers and not self.should_stop():
+                task = task_queue.pop(0)
+                future = executor.submit(self.worker, task)
+                inflight[future] = task
+
+            while inflight:
+                done, _ = wait(inflight.keys(), timeout=5, return_when=FIRST_COMPLETED)
+
+                if not done:
+                    if self.should_stop():
+                        print("接近 5 小时限制，准备停止并保存进度...")
+                        break
+                    continue
+
+                for future in done:
+                    task = inflight.pop(future)
+                    school_id, year, province_id = task
+                    key = self.task_key(school_id, year, province_id)
+
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        print(f"⚠️  任务异常 {key}: {e}")
+                        result = {"task": task, "status": "failed", "records": []}
+
+                    if result["status"] in {"success", "no_data"}:
+                        self.completed_keys.add(key)
+                        self.append_records(result["records"])
+                    elif result["status"] == "failed":
+                        print(f"⚠️  请求失败，留待下轮续跑: {key}")
+
+                    processed_since_flush += 1
+
+                    if processed_since_flush >= self.flush_every:
+                        meta = self.create_meta(school_ids, years, province_ids)
+                        self.save_progress(school_ids, years, province_ids, meta)
+                        processed_since_flush = 0
+                        print(
+                            f"✓ 已落盘：completed={meta['completed_tasks']}, records={meta['total_records']}, remaining={meta['remaining_tasks']}, chunks={meta['chunk_files_count']}"
+                        )
+
+                while task_queue and len(inflight) < self.max_workers and not self.should_stop():
+                    task = task_queue.pop(0)
+                    future = executor.submit(self.worker, task)
+                    inflight[future] = task
+
+                if self.should_stop():
+                    print("接近 5 小时限制，停止提交新任务...")
+                    break
+
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        meta = self.create_meta(school_ids, years, province_ids)
+        self.save_progress(school_ids, years, province_ids, meta)
+
+        print("\n" + "=" * 60)
+        print("招生计划爬取结束")
+        print(f"已完成任务: {meta['completed_tasks']} / {meta['total_tasks']}")
+        print(f"总记录数: {meta['total_records']}")
+        print(f"分片数: {meta['chunk_files_count']}")
+        print(f"是否需要续跑: {meta['resume_required']}")
+        print(f"剩余任务数: {meta['remaining_tasks']}")
+        print("=" * 60)
+
+        return meta
+
+
+if __name__ == "__main__":
+    years_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    crawler = PlanCrawler()
+    meta = crawler.crawl(years=years_arg)
+    print(json.dumps(meta, ensure_ascii=False))
