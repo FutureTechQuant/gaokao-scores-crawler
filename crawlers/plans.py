@@ -1,525 +1,747 @@
-import gzip
-import hashlib
-import json
 import os
-import random
-import sys
+import json
 import threading
-import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .base import BaseCrawler
+from utils.file_utils import safe_name, write_json_atomic, read_json
+
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"true", "1", "yes", "y", "on"}
 
 
 class PlanCrawler(BaseCrawler):
+    CRAWLER_NAME = "plans"
+    ENTITY_TYPE = "school_year_plan"
+    CURSOR_TYPE = "school_cursor"
+
+    REQUEST_TIMEOUT = 10
+    FAILURE_PAUSE_THRESHOLD = 8
+
     def __init__(self):
         super().__init__()
-
         self._first_logged = False
-        self._first_log_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._local = threading.local()
+        self.debug = parse_bool(os.getenv("PLAN_DEBUG", "false"), False)
+        self.skip_existing = parse_bool(os.getenv("PLAN_SKIP_EXISTING", "true"), True)
 
-        self.state_file = Path("data/plans_progress.json")
-        self.manifest_file = Path("data/manifest.json")
-        self.chunk_dir = Path("data/chunks")
+        self.school_data_dir = Path(os.getenv("SCHOOL_DATA_DIR", "data/schools"))
+        self.school_source_file = Path(os.getenv("SCHOOL_SOURCE_FILE", "data/schools.json"))
+        self.plan_data_dir = Path(os.getenv("PLAN_DATA_DIR", "data/plans"))
+        self.progress_dir = Path(os.getenv("PLAN_PROGRESS_DIR", "data/plans_progress"))
+        self.completed_dir = Path(os.getenv("PLAN_COMPLETED_DIR", "data/plans_progress/completed"))
 
-        self.max_workers = max(1, int(os.getenv("PLAN_MAX_WORKERS", "6")))
-        self.flush_every = max(20, int(os.getenv("PLAN_FLUSH_EVERY", "200")))
-        self.chunk_record_limit = max(
-            1000, int(os.getenv("PLAN_CHUNK_RECORD_LIMIT", "200000"))
-        )
-        self.time_limit_seconds = int(
-            os.getenv("PLAN_TIME_LIMIT_SECONDS", str(5 * 60 * 60 - 15 * 60))
-        )  # 默认 4小时45分钟
-        self.start_time = time.time()
+        self.max_schools_per_run = int(os.getenv("PLAN_MAX_SCHOOLS_PER_RUN", "20"))
+        self.province_workers = max(1, int(os.getenv("PLAN_PROVINCE_WORKERS", "4")))
 
-        self.completed_keys = set()
-        self.chunk_files = []
-        self.current_chunk_index = 0
-        self.current_chunk_records = 0
-        self.current_chunk_file = None
-        self.total_records = 0
-        self.scope_signature = None
-        self.scope_name = None
+        self.school_shard = str(os.getenv("PLAN_SCHOOL_SHARD", "all")).strip().lower()
+        if self.school_shard not in {"all", "upper", "lower"}:
+            self.school_shard = "all"
+
+        self._thread_local = threading.local()
 
         self.province_dict = {
-            "11": "北京",
-            "12": "天津",
-            "13": "河北",
-            "14": "山西",
-            "15": "内蒙古",
-            "21": "辽宁",
-            "22": "吉林",
-            "23": "黑龙江",
-            "31": "上海",
-            "32": "江苏",
-            "33": "浙江",
-            "34": "安徽",
-            "35": "福建",
-            "36": "江西",
-            "37": "山东",
-            "41": "河南",
-            "42": "湖北",
-            "43": "湖南",
-            "44": "广东",
-            "45": "广西",
-            "46": "海南",
-            "50": "重庆",
-            "51": "四川",
-            "52": "贵州",
-            "53": "云南",
-            "54": "西藏",
-            "61": "陕西",
-            "62": "甘肃",
-            "63": "青海",
-            "64": "宁夏",
-            "65": "新疆",
-            "71": "台湾",
-            "81": "香港",
-            "82": "澳门",
+            "11": "北京", "12": "天津", "13": "河北", "14": "山西", "15": "内蒙古",
+            "21": "辽宁", "22": "吉林", "23": "黑龙江",
+            "31": "上海", "32": "江苏", "33": "浙江", "34": "安徽", "35": "福建", "36": "江西", "37": "山东",
+            "41": "河南", "42": "湖北", "43": "湖南",
+            "44": "广东", "45": "广西", "46": "海南",
+            "50": "重庆", "51": "四川", "52": "贵州", "53": "云南", "54": "西藏",
+            "61": "陕西", "62": "甘肃", "63": "青海", "64": "宁夏", "65": "新疆",
+            "71": "台湾", "81": "香港", "82": "澳门",
         }
 
-    def get_thread_session(self):
-        if not hasattr(self._local, "session"):
-            session = requests.Session()
-            session.headers.update(self.headers)
-            self._local.session = session
-        return self._local.session
+        retry_strategy = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=max(self.province_workers, 4),
+            pool_maxsize=max(self.province_workers, 4),
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def build_worker_session(self):
+        session = requests.Session()
+        session.headers.update(self.headers)
+
+        retry_strategy = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=max(self.province_workers, 4),
+            pool_maxsize=max(self.province_workers, 4),
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def get_worker_session(self):
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = self.build_worker_session()
+            self._thread_local.session = session
+        return session
 
     def parse_years(self, years_input):
         if isinstance(years_input, list):
             return [str(y).strip() for y in years_input if str(y).strip()]
 
-        if years_input is None:
-            return []
+        if isinstance(years_input, str):
+            raw = years_input.strip()
+            if not raw:
+                return []
 
-        if isinstance(years_input, (int, float)):
-            return [str(int(years_input))]
+            if "-" in raw:
+                start, end = raw.split("-", 1)
+                start = int(start.strip())
+                end = int(end.strip())
+                if start <= end:
+                    return [str(y) for y in range(end, start - 1, -1)]
+                return [str(y) for y in range(start, end - 1, -1)]
 
-        years_input = str(years_input).strip()
-        if not years_input:
-            return []
+            if "," in raw:
+                return [y.strip() for y in raw.split(",") if y.strip()]
 
-        if "-" in years_input:
-            start, end = [x.strip() for x in years_input.split("-", 1)]
-            start_year, end_year = int(start), int(end)
-            step = -1 if start_year > end_year else 1
-            return [str(y) for y in range(start_year, end_year + step, step)]
+            return [raw]
 
-        if "," in years_input:
-            return [y.strip() for y in years_input.split(",") if y.strip()]
+        return years_input or []
 
-        return [years_input]
-
-    def load_school_ids(self, school_ids=None):
-        if school_ids is not None:
-            return [str(sid) for sid in school_ids]
-
-        with open("data/schools.json", "r", encoding="utf-8") as f:
-            schools_data = json.load(f)
-
-        if isinstance(schools_data, list):
-            schools = schools_data
-        elif isinstance(schools_data, dict):
-            schools = schools_data.get("data", []) or [schools_data]
-        else:
-            raise ValueError(f"schools.json 数据格式错误: {type(schools_data)}")
-
-        sample_count = int(os.getenv("SAMPLE_SCHOOLS", "0") or 0)
-        if sample_count > 0:
-            schools = schools[:sample_count]
-
-        school_ids = [
-            str(s["school_id"])
-            for s in schools
-            if isinstance(s, dict) and s.get("school_id")
-        ]
-
-        if not school_ids:
-            raise ValueError("未找到有效的学校ID")
-
-        return school_ids
-
-    def build_scope_signature(self, school_ids, years, province_ids):
-        raw = json.dumps(
-            {
-                "school_ids": school_ids,
-                "years": years,
-                "province_ids": province_ids,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-    def build_scope_name(self, years):
-        joined = "-".join(years)
-        return joined[:120]
-
-    def task_key(self, school_id, year, province_id):
-        return f"{school_id}_{year}_{province_id}"
-
-    def build_tasks(self, school_ids, years, province_ids, completed_keys=None):
-        completed_keys = completed_keys or set()
-        tasks = []
-
-        for school_id in school_ids:
-            for year in years:
-                for province_id in province_ids:
-                    key = self.task_key(school_id, year, province_id)
-                    if key not in completed_keys:
-                        tasks.append((str(school_id), str(year), str(province_id)))
-
-        return tasks
-
-    def get_plan_data(self, school_id, year, province_id):
-        url = f"https://static-data.gaokao.cn/www/2.0/schoolspecialplan/{school_id}/{year}/{province_id}.json"
-        session = self.get_thread_session()
-
-        try:
-            response = session.get(url, timeout=10)
-
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("code") == "0000" and "data" in result:
-                    return result["data"]
-            elif response.status_code == 404:
-                return "no_data"
-        except Exception:
+    def normalize_school_target(self, school_id, school_name=None):
+        if not school_id:
             return None
+        return {
+            "school_id": str(school_id),
+            "school_name": school_name,
+        }
+
+    def _add_school_target(self, targets, seen_ids, school_id, school_name=None):
+        target = self.normalize_school_target(school_id, school_name)
+        if not target:
+            return
+
+        if target["school_id"] in seen_ids:
+            return
+
+        seen_ids.add(target["school_id"])
+        targets.append(target)
+
+    def _extract_targets_from_payload(self, payload, targets, seen_ids, fallback_name=None):
+        if isinstance(payload, dict):
+            data = payload.get("data")
+
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    school_id = item.get("school_id") or item.get("id")
+                    school_name = item.get("name") or item.get("school_name")
+                    self._add_school_target(targets, seen_ids, school_id, school_name)
+                return
+
+            if isinstance(data, dict):
+                school = data
+                school_id = school.get("school_id") or payload.get("school_id")
+                school_name = school.get("name") or payload.get("name") or fallback_name
+                self._add_school_target(targets, seen_ids, school_id, school_name)
+                return
+
+            school_id = payload.get("school_id") or payload.get("id")
+            school_name = payload.get("name") or payload.get("school_name") or fallback_name
+            self._add_school_target(targets, seen_ids, school_id, school_name)
+            return
+
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                school_id = item.get("school_id") or item.get("id")
+                school_name = item.get("name") or item.get("school_name") or fallback_name
+                self._add_school_target(targets, seen_ids, school_id, school_name)
+
+    def apply_school_shard(self, targets):
+        if not targets:
+            return targets
+
+        if self.school_shard == "all":
+            return targets
+
+        midpoint = (len(targets) + 1) // 2
+
+        if self.school_shard == "upper":
+            result = targets[:midpoint]
+        else:
+            result = targets[midpoint:]
+
+        print(f"学校分片: {self.school_shard}，分片学校数 {len(result)} / {len(targets)}")
+        return result
+
+    def load_school_targets_from_files(self):
+        sample_count = int(os.getenv("SAMPLE_SCHOOLS", "3"))
+        targets = []
+        seen_ids = set()
+
+        if self.school_data_dir.exists():
+            for path in self.school_data_dir.rglob("*.json"):
+                try:
+                    payload = read_json(path, default={}) or {}
+                    self._extract_targets_from_payload(
+                        payload=payload,
+                        targets=targets,
+                        seen_ids=seen_ids,
+                        fallback_name=path.stem,
+                    )
+                except Exception as e:
+                    print(f"⚠️ 读取学校文件失败: {path} - {e}")
+        else:
+            print(f"ℹ️ 未找到学校目录: {self.school_data_dir}")
+
+        if self.school_source_file.exists():
+            try:
+                payload = read_json(self.school_source_file, default={}) or {}
+                self._extract_targets_from_payload(
+                    payload=payload,
+                    targets=targets,
+                    seen_ids=seen_ids,
+                    fallback_name=self.school_source_file.stem,
+                )
+            except Exception as e:
+                print(f"⚠️ 读取学校聚合文件失败: {self.school_source_file} - {e}")
+        else:
+            print(f"ℹ️ 未找到学校聚合文件: {self.school_source_file}")
+
+        def sort_key(x):
+            sid = str(x["school_id"])
+            return (0, int(sid)) if sid.isdigit() else (1, sid)
+
+        targets.sort(key=sort_key)
+        total_before_shard = len(targets)
+        targets = self.apply_school_shard(targets)
+
+        if sample_count > 0:
+            targets = targets[:sample_count]
+
+        if targets:
+            print(f"从学校数据源读取到 {total_before_shard} 所学校，本次目标学校数 {len(targets)}")
+        else:
+            print("⚠️ 未读取到有效学校目标")
+
+        return targets
+
+    def load_school_targets(self, school_targets=None):
+        if school_targets is not None:
+            result = []
+            for item in school_targets:
+                if isinstance(item, dict):
+                    target = self.normalize_school_target(
+                        item.get("school_id"),
+                        item.get("school_name") or item.get("name"),
+                    )
+                else:
+                    target = self.normalize_school_target(item, None)
+                if target:
+                    result.append(target)
+
+            result = self.apply_school_shard(result)
+            return result
+
+        file_targets = self.load_school_targets_from_files()
+        if file_targets:
+            return file_targets
+
+        print("⚠️ 没有可用学校数据")
+        return []
+
+    def get_progress_file(self, year_label):
+        custom = os.getenv("PLAN_PROGRESS_FILE", "").strip()
+        if custom:
+            return Path(custom)
+        if self.school_shard == "all":
+            return self.progress_dir / f"{year_label}.json"
+        return self.progress_dir / f"{year_label}-{self.school_shard}.json"
+
+    def load_year_progress(self, year_label, target_school_ids):
+        path = self.get_progress_file(year_label)
+        if not path.exists():
+            return set(), {}
+
+        progress = read_json(path, default={}) or {}
+
+        saved_year = str(progress.get("year", ""))
+        if saved_year and saved_year != str(year_label):
+            print("⚠️ progress 年份不一致，忽略旧断点")
+            return set(), {}
+
+        saved_shard = str(progress.get("school_shard", "") or "").strip().lower()
+        if saved_shard and saved_shard != self.school_shard:
+            print("⚠️ progress 分片不一致，忽略旧断点")
+            return set(), {}
+
+        saved_target_ids = [str(x) for x in progress.get("target_school_ids", [])]
+        current_target_ids = [str(x) for x in target_school_ids]
+
+        if saved_target_ids and saved_target_ids != current_target_ids:
+            print("⚠️ progress 的目标学校集合与当前不一致，忽略旧断点")
+            return set(), {}
+
+        completed_school_ids = {str(x) for x in progress.get("completed_school_ids", [])}
+        print(
+            f"↻ 检测到断点：year={year_label}，shard={self.school_shard}，"
+            f"已完成学校 {len(completed_school_ids)} / {len(current_target_ids)}"
+        )
+        return completed_school_ids, progress
+
+    def save_year_progress(
+        self,
+        year_label,
+        target_school_ids,
+        completed_school_ids,
+        last_school_id=None,
+        consecutive_failures=0,
+        last_error=None,
+    ):
+        path = self.get_progress_file(year_label)
+        payload = {
+            "year": str(year_label),
+            "school_shard": self.school_shard,
+            "target_school_ids": [str(x) for x in target_school_ids],
+            "completed_school_ids": sorted(str(x) for x in completed_school_ids),
+            "school_total": len(target_school_ids),
+            "school_done": len(completed_school_ids),
+            "last_school_id": str(last_school_id) if last_school_id else None,
+            "consecutive_failures": int(consecutive_failures),
+            "last_error": last_error,
+            "updated_at": self.now_str(),
+        }
+        write_json_atomic(path, payload)
+
+    def clear_year_progress(self, year_label):
+        path = self.get_progress_file(year_label)
+        if path.exists():
+            path.unlink()
+
+    def get_completed_marker_file(self, year_label, school_id):
+        return self.completed_dir / str(year_label) / f"{school_id}.json"
+
+    def mark_school_completed(self, year_label, school_id, school_name, province_ids, hit_province_ids, record_count):
+        payload = {
+            "year": str(year_label),
+            "school_shard": self.school_shard,
+            "school_id": str(school_id),
+            "school_name": school_name,
+            "checked_province_ids": [str(x) for x in province_ids],
+            "hit_province_ids": sorted(str(x) for x in hit_province_ids),
+            "record_count": int(record_count),
+            "completed_at": self.now_str(),
+        }
+        write_json_atomic(self.get_completed_marker_file(year_label, school_id), payload)
+
+    def get_completed_school_ids_from_files(self, year_label):
+        root = self.completed_dir / str(year_label)
+        result = set()
+        if not root.exists():
+            return result
+
+        for path in root.rglob("*.json"):
+            try:
+                payload = read_json(path, default={}) or {}
+                school_id = payload.get("school_id")
+                if school_id:
+                    result.add(str(school_id))
+            except Exception:
+                continue
+
+        return result
+
+    def get_primary_plan_file_path(self, year_label, province_id, school_name):
+        province_name = safe_name(self.province_dict.get(str(province_id), f"省份{province_id}"))
+        school_file_name = safe_name(school_name or "未知学校")
+        return self.plan_data_dir / str(year_label) / province_name / f"{school_file_name}.json"
+
+    def get_suffix_plan_file_path(self, year_label, province_id, school_name, school_id):
+        province_name = safe_name(self.province_dict.get(str(province_id), f"省份{province_id}"))
+        school_file_name = f"{safe_name(school_name or school_id or '未知学校')}__{school_id}"
+        return self.plan_data_dir / str(year_label) / province_name / f"{school_file_name}.json"
+
+    def find_existing_plan_file(self, year_label, province_id, school_name, school_id):
+        primary = self.get_primary_plan_file_path(year_label, province_id, school_name)
+        suffix = self.get_suffix_plan_file_path(year_label, province_id, school_name, school_id)
+
+        if primary.exists():
+            try:
+                payload = read_json(primary, default={}) or {}
+                if str(payload.get("school_id")) == str(school_id):
+                    return primary
+            except Exception:
+                pass
+
+        if suffix.exists():
+            try:
+                payload = read_json(suffix, default={}) or {}
+                if str(payload.get("school_id")) == str(school_id):
+                    return suffix
+            except Exception:
+                pass
 
         return None
 
-    def load_progress(self):
-        if not self.state_file.exists():
-            return None
+    def get_plan_file_path(self, year_label, province_id, school_name, school_id):
+        existing = self.find_existing_plan_file(year_label, province_id, school_name, school_id)
+        if existing:
+            return existing
 
-        with open(self.state_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        primary = self.get_primary_plan_file_path(year_label, province_id, school_name)
+        if primary.exists():
+            return self.get_suffix_plan_file_path(year_label, province_id, school_name, school_id)
 
-    def reset_scope_files(self):
-        if self.chunk_dir.exists():
-            for file in self.chunk_dir.glob("*.jsonl.gz"):
-                file.unlink()
+        return primary
 
-        self.chunk_dir.mkdir(parents=True, exist_ok=True)
-        self.chunk_files = []
-        self.current_chunk_index = 0
-        self.current_chunk_records = 0
-        self.current_chunk_file = None
-        self.total_records = 0
+    def plan_file_exists(self, year_label, province_id, school_name, school_id):
+        return self.find_existing_plan_file(year_label, province_id, school_name, school_id) is not None
 
-    def restore_progress(self, progress):
-        self.completed_keys = set(progress.get("completed", []))
-        self.chunk_files = progress.get("chunk_files", [])
-        self.current_chunk_index = int(progress.get("current_chunk_index", 0) or 0)
-        self.current_chunk_records = int(progress.get("current_chunk_records", 0) or 0)
-        self.total_records = int(progress.get("total_records", 0) or 0)
+    def get_existing_province_ids_for_school(self, year_label, school_id, school_name, province_ids):
+        existing = set()
+        for province_id in province_ids:
+            if self.plan_file_exists(year_label, province_id, school_name, school_id):
+                existing.add(str(province_id))
+        return existing
 
-        current_name = progress.get("current_chunk")
-        self.current_chunk_file = self.chunk_dir / current_name if current_name else None
-        self.chunk_dir.mkdir(parents=True, exist_ok=True)
+    def build_document_payload(
+        self,
+        school_id,
+        school_name,
+        year_label,
+        province_id,
+        raw_data,
+        records,
+    ):
+        province_name = self.province_dict.get(str(province_id), f"省份{province_id}")
+        return {
+            "update_time": self.now_str(),
+            "school_id": str(school_id),
+            "school_name": school_name,
+            "year": str(year_label),
+            "province_id": str(province_id),
+            "province": province_name,
+            "record_count": len(records),
+            "records": records,
+            "data": raw_data,
+        }
 
-    def next_chunk_path(self):
-        self.current_chunk_index += 1
-        filename = f"plans-{self.scope_name}-{self.current_chunk_index:05d}.jsonl.gz"
+    def save_plan_json(self, year_label, province_id, school_id, school_name, payload):
+        file_path = self.get_plan_file_path(
+            year_label=year_label,
+            province_id=province_id,
+            school_name=school_name,
+            school_id=school_id,
+        )
+        write_json_atomic(file_path, payload)
 
-        if filename not in self.chunk_files:
-            self.chunk_files.append(filename)
+    def get_plan_data(self, school_id, year, province_id, session=None):
+        url = f"https://static-data.gaokao.cn/www/2.0/schoolspecialplan/{school_id}/{year}/{province_id}.json"
+        result = self.get_json_with_session(
+            session=session or self.session,
+            url=url,
+            retry=2,
+            delay=2,
+            timeout=self.REQUEST_TIMEOUT,
+            allow_404=True,
+        )
 
-        self.current_chunk_file = self.chunk_dir / filename
-        self.current_chunk_records = 0
-        return self.current_chunk_file
+        if result == "no_data":
+            return "no_data"
 
-    def ensure_chunk_file(self):
-        self.chunk_dir.mkdir(parents=True, exist_ok=True)
+        if isinstance(result, dict) and self.is_success_code(result.get("code")) and "data" in result:
+            return result["data"]
 
-        if self.current_chunk_file is None:
-            return self.next_chunk_path()
+        return None
 
-        if self.current_chunk_records >= self.chunk_record_limit:
-            return self.next_chunk_path()
+    def get_json_with_session(self, session, url, retry=3, delay=2, timeout=15, allow_404=False):
+        for attempt in range(retry):
+            try:
+                response = session.get(url, timeout=timeout)
 
-        return self.current_chunk_file
+                if response.status_code == 200:
+                    try:
+                        return response.json()
+                    except json.JSONDecodeError as e:
+                        print(f"⚠️ JSON解析失败: {str(e)}")
+                        print(f" URL: {url}")
+                        print(f" 响应前200字符: {response.text[:200]}")
+                        return None
 
-    def append_records(self, records):
-        if not records:
+                if allow_404 and response.status_code == 404:
+                    return "no_data"
+
+                if response.status_code in (429, 500, 502, 503, 504):
+                    pass
+
+            except requests.exceptions.Timeout:
+                pass
+            except requests.exceptions.RequestException:
+                pass
+
+        return None
+
+    def log_first_structure(self, data):
+        if self._first_logged or not self.debug or not data or data == "no_data":
             return
 
-        with self._write_lock:
-            for record in records:
-                chunk_path = self.ensure_chunk_file()
-                with gzip.open(chunk_path, "at", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                self.current_chunk_records += 1
-                self.total_records += 1
+        print(f"\n{'─' * 60}")
+        print("首次响应数据结构")
+        print(f"{'─' * 60}")
+        print(f"data类型: {type(data).__name__}")
 
-    def save_manifest(self, school_ids, years, province_ids, meta):
-        payload = {
-            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "scope_signature": self.scope_signature,
-            "scope_name": self.scope_name,
-            "years": years,
-            "school_count": len(school_ids),
-            "province_count": len(province_ids),
-            "total_records": self.total_records,
-            "chunk_record_limit": self.chunk_record_limit,
-            "chunk_files": self.chunk_files,
-            "meta": meta,
-        }
-        with open(self.manifest_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        if isinstance(data, dict):
+            print(f"data包含键: {list(data.keys())}")
+            sample_item = None
+            sample_type = None
 
-    def save_progress(self, school_ids, years, province_ids, meta):
-        payload = {
-            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "scope_signature": self.scope_signature,
-            "scope_name": self.scope_name,
-            "completed_count": len(self.completed_keys),
-            "completed": sorted(self.completed_keys),
-            "chunk_dir": str(self.chunk_dir),
-            "chunk_files": self.chunk_files,
-            "current_chunk": self.current_chunk_file.name if self.current_chunk_file else None,
-            "current_chunk_index": self.current_chunk_index,
-            "current_chunk_records": self.current_chunk_records,
-            "total_records": self.total_records,
-            "meta": meta,
-        }
+            for plan_type, plan_info in data.items():
+                if isinstance(plan_info, dict):
+                    items = plan_info.get("item", [])
+                    if items:
+                        sample_type = plan_type
+                        sample_item = items[0]
+                        break
 
-        with self._state_lock:
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+            if sample_type:
+                print(f"招生类型: {sample_type}")
 
-        self.save_manifest(school_ids, years, province_ids, meta)
+            if isinstance(sample_item, dict):
+                fields = list(sample_item.keys())
+                print(f"字段数: {len(fields)}")
+                for i, field in enumerate(fields[:25], 1):
+                    value = sample_item.get(field)
+                    if value is None:
+                        preview = "None"
+                    elif isinstance(value, str):
+                        preview = f'"{value[:40]}..."' if len(value) > 40 else f'"{value}"'
+                    elif isinstance(value, (list, dict)):
+                        preview = f"{type(value).__name__}({len(value)})"
+                    else:
+                        preview = str(value)
+                    print(f"{i:2}. {field:25} = {preview}")
 
-    def should_stop(self):
-        return (time.time() - self.start_time) >= self.time_limit_seconds
+        print(f"{'─' * 60}\n")
+        self._first_logged = True
 
-    def parse_plan_records(self, school_id, year, province_id, data):
-        province_name = self.province_dict.get(province_id, f"省份{province_id}")
+    def extract_records(self, school_id, year, province_id, province_name, data):
         records = []
 
-        if not isinstance(data, dict):
+        if not data or data == "no_data" or not isinstance(data, dict):
             return records
-
-        with self._first_log_lock:
-            if not self._first_logged:
-                print("\n" + "─" * 60)
-                print("首次成功响应结构")
-                print(f"school_id={school_id}, year={year}, province={province_name}")
-                print(f"data keys: {list(data.keys())}")
-                print("─" * 60 + "\n")
-                self._first_logged = True
 
         for plan_type, plan_info in data.items():
             if not isinstance(plan_info, dict):
                 continue
 
             items = plan_info.get("item", [])
-            if not isinstance(items, list):
-                continue
-
             for item in items:
                 if not isinstance(item, dict):
                     continue
 
-                records.append(
-                    {
-                        "school_id": school_id,
-                        "year": year,
-                        "province_id": province_id,
-                        "province": province_name,
-                        "plan_type": plan_type,
-                        "batch": item.get("local_batch_name"),
-                        "type": item.get("type"),
-                        "major": item.get("sp_name") or item.get("spname"),
-                        "major_code": item.get("spcode"),
-                        "major_group": item.get("sg_name"),
-                        "major_group_code": item.get("sg_code"),
-                        "major_group_info": item.get("sg_info"),
-                        "level1_name": item.get("level1_name"),
-                        "level2_name": item.get("level2_name"),
-                        "level3_name": item.get("level3_name"),
-                        "plan_number": item.get("num") or item.get("plan_num"),
-                        "years": item.get("length") or item.get("years"),
-                        "tuition": item.get("tuition"),
-                        "note": item.get("note") or item.get("remark"),
-                    }
-                )
+                records.append({
+                    "school_id": str(school_id),
+                    "year": str(year),
+                    "province_id": str(province_id),
+                    "province": province_name,
+                    "plan_type": plan_type,
+                    "batch": item.get("local_batch_name"),
+                    "type": item.get("type"),
+                    "major": item.get("sp_name") or item.get("spname"),
+                    "major_code": item.get("spcode"),
+                    "major_group": item.get("sg_name"),
+                    "major_group_code": item.get("sg_code"),
+                    "major_group_info": item.get("sg_info"),
+                    "level1_name": item.get("level1_name"),
+                    "level2_name": item.get("level2_name"),
+                    "level3_name": item.get("level3_name"),
+                    "plan_number": item.get("num") or item.get("plan_num"),
+                    "years": item.get("length") or item.get("years"),
+                    "tuition": item.get("tuition"),
+                    "note": item.get("note") or item.get("remark"),
+                })
 
         return records
 
-    def worker(self, task):
-        school_id, year, province_id = task
-
-        if self.should_stop():
-            return {"task": task, "status": "stopped", "records": []}
-
-        data = self.get_plan_data(school_id, year, province_id)
-        time.sleep(random.uniform(0.05, 0.25))
-
-        if data == "no_data":
-            return {"task": task, "status": "no_data", "records": []}
-
-        if data is None:
-            return {"task": task, "status": "failed", "records": []}
-
-        records = self.parse_plan_records(school_id, year, province_id, data)
-        return {"task": task, "status": "success", "records": records}
-
-    def create_meta(self, school_ids, years, province_ids):
-        remaining_tasks = self.build_tasks(
-            school_ids, years, province_ids, self.completed_keys
-        )
-
-        remaining_years = []
-        seen = set()
-        for _, year, _ in remaining_tasks:
-            if year not in seen:
-                seen.add(year)
-                remaining_years.append(year)
-
-        return {
-            "finished": len(remaining_tasks) == 0,
-            "resume_required": len(remaining_tasks) > 0,
-            "total_tasks": len(school_ids) * len(years) * len(province_ids),
-            "completed_tasks": len(self.completed_keys),
-            "total_records": self.total_records,
-            "max_workers": self.max_workers,
-            "years": years,
-            "remaining_tasks": len(remaining_tasks),
-            "remaining_years": remaining_years,
-            "years_arg": ",".join(remaining_years) if remaining_years else ",".join(years),
-            "chunk_files_count": len(self.chunk_files),
-            "scope_signature": self.scope_signature,
-            "scope_name": self.scope_name,
-        }
-
-    def crawl(self, school_ids=None, years=None, province_ids=None):
-        if years is None:
-            years = self.parse_years(os.getenv("PLAN_YEARS", "2025,2024,2023"))
-        else:
-            years = self.parse_years(years)
-
-        if not years:
-            raise ValueError("years 不能为空")
-
-        province_ids = [str(p) for p in (province_ids or list(self.province_dict.keys()))]
-        school_ids = self.load_school_ids(school_ids)
-
-        self.scope_signature = self.build_scope_signature(school_ids, years, province_ids)
-        self.scope_name = self.build_scope_name(years)
-
-        progress = self.load_progress() if os.getenv("PLAN_RESUME", "1") == "1" else None
-
-        if progress and progress.get("scope_signature") == self.scope_signature:
-            self.restore_progress(progress)
-        else:
-            self.completed_keys = set()
-            self.reset_scope_files()
-
-        pending_tasks = self.build_tasks(
-            school_ids, years, province_ids, self.completed_keys
-        )
-
-        print("=" * 60)
-        print("开始爬取招生计划")
-        print(f"学校数: {len(school_ids)}")
-        print(f"年份: {', '.join(years)}")
-        print(f"省份数: {len(province_ids)}")
-        print(f"线程数: {self.max_workers}")
-        print(f"已完成任务数: {len(self.completed_keys)}")
-        print(f"待处理任务数: {len(pending_tasks)}")
-        print("=" * 60)
-
-        if not pending_tasks:
-            meta = self.create_meta(school_ids, years, province_ids)
-            self.save_progress(school_ids, years, province_ids, meta)
-            return meta
-
-        task_queue = list(pending_tasks)
-        inflight = {}
-        processed_since_flush = 0
-
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+    def fetch_one_province(self, school_id, school_name, year_label, province_id):
+        province_id = str(province_id)
+        province_name = self.province_dict.get(province_id, f"省份{province_id}")
 
         try:
-            while task_queue and len(inflight) < self.max_workers and not self.should_stop():
-                task = task_queue.pop(0)
-                future = executor.submit(self.worker, task)
-                inflight[future] = task
+            session = self.get_worker_session()
+            data = self.get_plan_data(school_id, year_label, province_id, session=session)
 
-            while inflight:
-                done, _ = wait(inflight.keys(), timeout=5, return_when=FIRST_COMPLETED)
+            if data == "no_data":
+                return {
+                    "province_id": province_id,
+                    "province_name": province_name,
+                    "status": "no_data",
+                    "records": [],
+                    "payload": None,
+                    "raw_data": None,
+                }
 
-                if not done:
-                    if self.should_stop():
-                        print("接近 5 小时限制，准备停止并保存进度...")
-                        break
-                    continue
+            if data is None:
+                return {
+                    "province_id": province_id,
+                    "province_name": province_name,
+                    "status": "error",
+                    "records": [],
+                    "payload": None,
+                    "raw_data": None,
+                }
 
-                for future in done:
-                    task = inflight.pop(future)
-                    school_id, year, province_id = task
-                    key = self.task_key(school_id, year, province_id)
+            records = self.extract_records(school_id, year_label, province_id, province_name, data)
+            payload = self.build_document_payload(
+                school_id=school_id,
+                school_name=school_name,
+                year_label=year_label,
+                province_id=province_id,
+                raw_data=data,
+                records=records,
+            )
 
-                    try:
-                        result = future.result()
-                    except Exception as e:
-                        print(f"⚠️  任务异常 {key}: {e}")
-                        result = {"task": task, "status": "failed", "records": []}
+            return {
+                "province_id": province_id,
+                "province_name": province_name,
+                "status": "ok",
+                "records": records,
+                "payload": payload,
+                "raw_data": data,
+            }
+        except Exception:
+            return {
+                "province_id": province_id,
+                "province_name": province_name,
+                "status": "error",
+                "records": [],
+                "payload": None,
+                "raw_data": None,
+            }
 
-                    if result["status"] in {"success", "no_data"}:
-                        self.completed_keys.add(key)
-                        self.append_records(result["records"])
-                    elif result["status"] == "failed":
-                        print(f"⚠️  请求失败，留待下轮续跑: {key}")
+    def crawl_one_year(self, year_label, school_targets=None, province_ids=None, mode=None):
+        province_ids = [str(x) for x in (province_ids or list(self.province_dict.keys()))]
+        school_targets = self.load_school_targets(school_targets)
 
-                    processed_since_flush += 1
+        if not school_targets:
+            return {
+                "year": str(year_label),
+                "school_shard": self.school_shard,
+                "status": "skipped",
+                "saved_documents": 0,
+                "completed_schools": 0,
+            }
 
-                    if processed_since_flush >= self.flush_every:
-                        meta = self.create_meta(school_ids, years, province_ids)
-                        self.save_progress(school_ids, years, province_ids, meta)
-                        processed_since_flush = 0
-                        print(
-                            f"✓ 已落盘：completed={meta['completed_tasks']}, records={meta['total_records']}, remaining={meta['remaining_tasks']}, chunks={meta['chunk_files_count']}"
-                        )
+        target_school_ids = [t["school_id"] for t in school_targets]
+        scope_key = f"{year_label}:{self.school_shard}"
 
-                while task_queue and len(inflight) < self.max_workers and not self.should_stop():
-                    task = task_queue.pop(0)
-                    future = executor.submit(self.worker, task)
-                    inflight[future] = task
+        if self.db_enabled:
+            self.job_id = self.start_job(
+                crawler_name=self.CRAWLER_NAME,
+                mode=mode or os.getenv("CRAWL_MODE", "full"),
+                scope_key=scope_key,
+                year=str(year_label),
+                meta_json={
+                    "school_shard": self.school_shard,
+                    "target_school_count": len(target_school_ids),
+                    "province_count": len(province_ids),
+                },
+            )
 
-                if self.should_stop():
-                    print("接近 5 小时限制，停止提交新任务...")
-                    break
+        progress_completed_ids, progress_meta = self.load_year_progress(year_label, target_school_ids)
 
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        file_completed_ids = set()
+        if self.skip_existing:
+            file_completed_ids = self.get_completed_school_ids_from_files(year_label)
+            if file_completed_ids:
+                print(f"✓ 已存在 {len(file_completed_ids)} 所学校的 {year_label} 年招生计划完成标记，自动跳过")
 
-        meta = self.create_meta(school_ids, years, province_ids)
-        self.save_progress(school_ids, years, province_ids, meta)
+        completed_school_ids = set(progress_completed_ids) | set(file_completed_ids)
+        pending_targets = [t for t in school_targets if t["school_id"] not in completed_school_ids]
 
-        print("\n" + "=" * 60)
-        print("招生计划爬取结束")
-        print(f"已完成任务: {meta['completed_tasks']} / {meta['total_tasks']}")
-        print(f"总记录数: {meta['total_records']}")
-        print(f"分片数: {meta['chunk_files_count']}")
-        print(f"是否需要续跑: {meta['resume_required']}")
-        print(f"剩余任务数: {meta['remaining_tasks']}")
-        print("=" * 60)
+        if not pending_targets:
+            self.clear_year_progress(year_label)
+            if self.db_enabled:
+                self.mark_job_done(
+                    meta_json={
+                        "year": str(year_label),
+                        "school_shard": self.school_shard,
+                        "saved_documents": 0,
+                        "completed_schools": len(completed_school_ids),
+                        "target_school_count": len(target_school_ids),
+                    }
+                )
+            print(f"\n{'=' * 60}")
+            print("✅ 该年份分片已全部完成，无需继续爬取")
+            print(f" 年份: {year_label}")
+            print(f" 分片: {self.school_shard}")
+            print(f" 学校完成: {len(completed_school_ids)} / {len(target_school_ids)}")
+            print(f"{'=' * 60}\n")
+            return {
+                "year": str(year_label),
+                "school_shard": self.school_shard,
+                "status": "done",
+                "saved_documents": 0,
+                "completed_schools": len(completed_school_ids),
+            }
 
-        return meta
+        consecutive_failures = int(progress_meta.get("consecutive_failures", 0) or 0)
 
+        print(f"\n{'=' * 60}")
+        print("开始爬取招生计划")
+        print(f"年份: {year_label}")
+        print(f"分片: {self.school_shard}")
+        print(f"学校总数: {len(target_school_ids)}")
+        print(f"已完成学校: {len(completed_school_ids)}")
+        print(f"待爬学校: {len(pending_targets)}")
+        print(f"省份数: {len(province_ids)}")
+        print(f"学校目录: {self.school_data_dir}")
+        print(f"学校聚合文件: {self.school_source_file}")
+        print(f"输出目录: {self.plan_data_dir}")
+        print(f"进度目录: {self.progress_dir}")
+        print(f"完成标记目录: {self.completed_dir}")
+        print(f"数据库启用: {'✓' if self.db_enabled else '✗'}")
+        print(f"省份并发数: {self.province_workers}")
+        print(f"单次最多完成学校数: {self.max_schools_per_run}")
+        print(f"{'=' * 60}\n")
 
-if __name__ == "__main__":
-    years_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    crawler = PlanCrawler()
-    meta = crawler.crawl(years=years_arg)
-    print(json.dumps(meta, ensure_ascii=False))
+        saved_documents = 0
+        processed_this_run = 0
+        has_incomplete_school = False
+
+        try:
+            for idx, target in enumerate(pending_targets, 1):
+                school_id = target["school_id"]
+                school_name = target.get("school_name")
+
+                print(f"\n[{idx}/{len(pending_targets)}] 学校ID: {school_id}" + (f" ({school_name})" if school_name else ""))
+
+                existing_province_ids = set()
+                if
