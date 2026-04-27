@@ -327,14 +327,9 @@ class ScoreCrawler(BaseCrawler):
             data = self.get_score_data(school_id, year, province_id)
 
             if not self._first_logged and data and data != 'no_data' and isinstance(data, dict):
-                print(f'
-{'─' * 50}')
                 print('首次响应数据结构:')
-                print(f'{'─' * 50}')
                 print(f'data类型: {type(data).__name__}')
                 print(f'data包含键: {list(data.keys())}')
-                print(f'{'─' * 50}
-')
                 self._first_logged = True
 
             if data and data != 'no_data' and isinstance(data, dict):
@@ -353,8 +348,6 @@ class ScoreCrawler(BaseCrawler):
                     status='running',
                 )
                 print(f'   ↻ 已阶段性保存 {province_name}: 学校进度 {school_index + 1}/{len(school_ids)}，当前 {len(province_payload["data"])} 条')
-
-            self.polite_sleep(0.2, 0.6)
 
         self.save_province_records(year, province_id, province_payload)
         self.clear_progress(year, province_id)
