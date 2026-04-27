@@ -297,15 +297,12 @@ class ScoreCrawler(BaseCrawler):
         province_payload = self.load_province_records(year, province_id)
         province_added_records = 0
 
-        print(f'{= * 60}')
         print('启动分数线爬虫')
         print(f'年份: {year}')
         print(f'省份: {province_name} ({province_id})')
         print(f'学校数: {len(school_ids)}')
         print(f'软截止: {self.format_duration(self.run_deadline_seconds)}')
         print(f'学校起始索引: {start_index + 1}/{len(school_ids)}')
-        print(f'{'=' * 60}
-')
 
         for school_index in range(start_index, len(school_ids)):
             if self.should_stop(started_at):
