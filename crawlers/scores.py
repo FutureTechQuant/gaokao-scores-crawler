@@ -297,8 +297,7 @@ class ScoreCrawler(BaseCrawler):
         province_payload = self.load_province_records(year, province_id)
         province_added_records = 0
 
-        print(f'
-{'=' * 60}')
+        print(f'{'=' * 60}')
         print('启动分数线爬虫')
         print(f'年份: {year}')
         print(f'省份: {province_name} ({province_id})')
